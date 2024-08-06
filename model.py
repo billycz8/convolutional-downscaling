@@ -1,10 +1,11 @@
+#%%
 import tensorflow as tf
 
 from tensorflow.keras.layers import *
 from tensorflow.keras.models import Model
 
 print(tf.__version__)
-
+#%%
 def grad_loss(v_gt, v):
     # Gradient loss
     loss = tf.reduce_mean(tf.abs(v - v_gt), axis=[1,2,3])
@@ -172,7 +173,7 @@ def get_model(PS=32, loss = grad_loss, optimizer = 'adam', nodes = [72, 144, 288
 
     # Input layers
     main_input  = Input(shape = (3, PS, PS, 1))
-    time        = Input(shape = (3, PS/8, PS/8, 1))
+    time        = Input(shape = (3, int(PS/8), int(PS/8), 1))
     lat         = Input(shape = (3, PS, PS, 1))
     lon         = Input(shape = (3, PS, PS, 1)) 
     height      = Input(shape = (3, PS, PS, 1))
@@ -204,9 +205,53 @@ def get_model(PS=32, loss = grad_loss, optimizer = 'adam', nodes = [72, 144, 288
 
 def main():
   model = get_model() # DCN
-  # model = get_model(residual=True) # RPN
-  # model.summary()
+#   model = get_model(residual=True) # RPN
+  model.summary()
+  print(model.summary())
 
-
+#%%
 if __name__ == '__main__':
     main()
+
+
+# %% 
+import numpy as np
+from sklearn.model_selection import train_test_split
+
+# Load data
+wind_speed_data = np.load('tensor.npy')  # Assuming wind speed is in the first channel
+wind_speed_data = wind_speed_data[:, :, :, 0]  # Extract wind speed channel
+
+# Normalize the data
+wind_speed_data = (wind_speed_data - np.min(wind_speed_data)) / (np.max(wind_speed_data) - np.min(wind_speed_data))
+# %%
+# Reshape data to fit the model input shape
+def reshape_data(data, patch_size=32, time_steps=3):
+    num_samples = data.shape[0] - time_steps + 1
+    patches = []
+    for i in range(num_samples):
+        patch = data[i:i+time_steps, :, :]
+        patches.append(patch)
+    patches = np.array(patches)
+    patches = np.expand_dims(patches, axis=-1)  # Add channel dimension
+    return patches
+
+# Example reshape
+patch_size = 16
+time_steps = 3
+wind_speed_patches = reshape_data(wind_speed_data, patch_size, time_steps)
+# %%
+# Split data
+train_data, val_data = train_test_split(wind_speed_patches, test_size=0.2, random_state=42)
+# %%
+# Train the model
+epochs = 50
+batch_size = 16
+model = get_model(PS=batch_size)
+history = model.fit([train_data, train_data, train_data, train_data, train_data], 
+                    train_data[:, 1, :, :, :],
+                    validation_data=([val_data, val_data, val_data, val_data, val_data], val_data[:, 1, :, :, :]),
+                    epochs=epochs,
+                    batch_size=batch_size)
+
+# %%
