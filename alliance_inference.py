@@ -18,6 +18,8 @@ from dotenv import load_dotenv
 import os
 load_dotenv()
 ORIGINAL_RESOLUTION = int(os.getenv("ORIGINAL_RESOLUTION"))
+FINAL_RESOLUTION = int(os.getenv("FINAL_RESOLUTION"))
+model_res = FINAL_RESOLUTION
 
 def grad_loss(v_gt, v):
     # Gradient loss
@@ -232,8 +234,9 @@ def get_model(PS=32, loss = grad_loss, optimizer = 'adam', nodes = [72, 144, 288
 # Load data
 
 # List of years to load
-years = [2019, 2020, 2021, 2022]
-# years = [2019]
+# years = [2019, 2020, 2021, 2022]
+year = 2022
+years = [year]
 # Initialize a list to store data for each year
 data_list = []
 
@@ -246,6 +249,7 @@ for year in years:
 
 # Concatenate all data along the first axis
 wind_speed_data = np.concatenate(data_list, axis=0)
+wind_speed_data_point = wind_speed_data[:,15,15,0]
 
 # wind_speed_data = np.load('tensor_2020.npy')  # Assuming wind speed is in the first channel
 print(f'Shape of wind speed data is {wind_speed_data.shape}')
@@ -294,21 +298,22 @@ def reshape_data(data, target_shape=(32, 32)):
     data = resized_data.numpy()
     return data
 
-def create_patches(data, time_steps):
-    num_samples = data.shape[0] - time_steps + 1
+def create_patches_inference(data, time_steps):
+    window_size = time_steps // 2 + 1
+    num_samples = data.shape[0] - window_size + 1
     training_patches = []
     patches = []
 
     for i in range(num_samples):
-        patch = data[i:i+time_steps]
-        patches.append(patch[1::2])
-        training_patches.append(patch[::2])
+        patch = data[i:i+window_size]
+        training_patches.append(patch)
+    
     training_timestep = time_steps//2+1
     relative_time = np.zeros((time_steps//2+1, data.shape[1]//8, data.shape[2]//8, 1))
 
     # Assign specific values to each slice along the first axis
     half_range = (training_timestep // 2) * 2
-    time_values = np.arange(-half_range, half_range + 1, 2) * ORIGINAL_RESOLUTION
+    time_values = np.arange(-half_range, half_range + 1, 2) * model_res
     for t in range(training_timestep):
         relative_time[t, :, :, 0] = time_values[t]
     relative_time_patches = np.tile(relative_time, (num_samples, 1, 1, 1, 1))
@@ -317,167 +322,43 @@ def create_patches(data, time_steps):
 
     return training_patches, relative_time_patches, patches
 
-
+# import pdb; pdb.set_trace()
 # Parameters
 patch_size = 32
 time_steps_label = 5 # means [0 2 4] for training [1 3] as label
 
-# Reshape data
-# reshaped_data = reshape_data(wind_speed_data, target_shape=(32, 32))
-
 # Create label patches with time_steps_label
 wind_speed_data = np.expand_dims(wind_speed_data, axis=-1)
-input_patches, input_time_patches, label_patches = create_patches(wind_speed_data, time_steps_label)
+input_patches, input_time_patches, label_patches = create_patches_inference(wind_speed_data, time_steps_label)
 
-
-# Reshape direction data
-# reshaped_direction = reshape_data(wind_direction_data, target_shape=(32, 32))
 
 # Create label patches with time_steps_label
 wind_direction_data = np.expand_dims(wind_direction_data, axis=-1)
-input_direction, _, _ = create_patches(wind_direction_data, time_steps_label)
+input_direction, _, _ = create_patches_inference(wind_direction_data, time_steps_label)
 
 #%%
 lat_long_top = np.expand_dims(lat_long_top, axis=-1)
-# lat_long_top_reshape = reshape_data(lat_long_top, target_shape=(32, 32))
 
-
-
-# input_patches, input_time_patches = input_patches[:label_patches.shape[0],:,:,:,:], input_time_patches[:label_patches.shape[0],:,:,:,:]
-
-print("Input patches shape:", input_patches.shape)
-print("Input time patches shape:", input_time_patches.shape)
-print("Label patches shape:", label_patches.shape)
-
-
-# %% get test size
-# take around last month for testing, no overlap
-test_size = input_patches.shape[0]//12//4
-test_inputs = input_patches[-test_size:,:,:,:,:]
-test_direction = input_direction[-test_size:,:,:,:,:]
-test_inputs_time = input_time_patches[-test_size:,:,:,:,:]
-test_labels = label_patches[-test_size:,:,:,:,:]
-
-# get train data size
-train_val_size = input_patches.shape[0] - test_size
-input_patches = input_patches[:train_val_size]
-input_time_patches = input_time_patches[:train_val_size]
-label_patches = label_patches[:train_val_size]
-input_direction = input_direction[:train_val_size]
-
-# %%
-# having batches because we want to minimize overlap of the validation and training
-def split_into_batches(data, group_batch_size):
-    """
-    Splits the data into batches of size `group_batch_size`.
-    Returns a list of batches (each batch is an array of indices).
-    """
-    num_batches = len(data) // group_batch_size
-    batches = [data[i*group_batch_size:(i+1)*group_batch_size] for i in range(num_batches)]
-    return batches
-
-def get_train_val_batches(batches, train_ratio=0.85):
-    """
-    Randomly splits the batches into training and validation sets.
-    `train_ratio` determines the percentage of data for training.
-    """
-    # Shuffle batches
-    np.random.shuffle(batches)
-    
-    # Split into training and validation sets
-    num_train_batches = int(train_ratio * len(batches))
-    train_batches = batches[:num_train_batches]
-    val_batches = batches[num_train_batches:]
-    
-    return train_batches, val_batches
-
-# Step 1: Split data into batches
-data_indices = np.arange(len(input_patches))  # Indices of the data
-group_batch_size = 144  # batch size of 144 which is a day
-batches = split_into_batches(data_indices, group_batch_size)
-
-# Step 2: Randomly split batches into training and validation
-train_batches, val_batches = get_train_val_batches(batches, train_ratio=0.85)
-
-# Step 3: Reassemble the data from batches
-train_indices = np.concatenate(train_batches)
-val_indices = np.concatenate(val_batches)
-
-# Step 4: Use the indices to split the data
-train_inputs = input_patches[train_indices]
-val_inputs = input_patches[val_indices]
-
-train_inputs_time = input_time_patches[train_indices]
-val_inputs_time = input_time_patches[val_indices]
-
-train_labels = label_patches[train_indices]
-val_labels = label_patches[val_indices]
-
-train_direction = input_direction[train_indices]
-val_direction = input_direction[val_indices]
-
-print("Train patches shape:", train_inputs.shape)
-print("Validation patches shape:", val_inputs.shape)
-
+# Renaming for inference
+inf_inputs, inf_inputs_time, inf_inputs_direction = input_patches, input_time_patches, input_direction
 
 #%% for the latitude longitude and topology
-train_extra = np.tile(np.expand_dims(np.tile(lat_long_top,reps=train_inputs.shape[0]),axis=-1),3).transpose(0,3,4,1,2)
-val_extra = np.tile(np.expand_dims(np.tile(lat_long_top,reps=val_inputs.shape[0]),axis=-1),3).transpose(0,3,4,1,2)
+inf_extra = np.tile(np.expand_dims(np.tile(lat_long_top,reps=inf_inputs.shape[0]),axis=-1),3).transpose(0,3,4,1,2)
 
 # %%
 from keras.callbacks import ModelCheckpoint
-
-# Define the model
-epochs = int(os.getenv("EPOCHS"))
-batch_size = 32
-model = get_model(PS=batch_size)
-
-
-from datetime import datetime
-# Define the checkpoint callback
-current_datetime = datetime.now().strftime('%Y%m%d_%H%M%S')
-
-checkpoint_callback = ModelCheckpoint(
-    filepath=f'checkpoints/best_model_{current_datetime}.keras',  # Filepath where the model will be saved
-    monitor='val_loss',        # Monitor the validation loss
-    save_best_only=True,       # Save only the best model
-    save_weights_only=False,   # Save the whole model, not just weights
-    mode='min',                # Mode 'min' means it will save the model with the minimum validation loss
-    verbose=1                  # Verbosity mode
-)
-
-# Train the model with validation and checkpointing
-history = model.fit(
-    [train_inputs, train_inputs_time, train_extra[0], train_extra[1], train_extra[2], train_direction],
-    train_labels,
-    validation_data=([val_inputs, val_inputs_time, val_extra[0], val_extra[1], val_extra[2], val_direction], val_labels),
-    epochs=epochs,
-    batch_size=batch_size,
-    callbacks=[checkpoint_callback],
-    verbose=1
-)
-
 
 #%% testing
 def transpose_fn(x):
       return tf.transpose(x, perm=[0, 4, 2, 3, 1])
 from keras.models import load_model
 
-#%% 
-test_extra = np.tile(np.expand_dims(np.tile(lat_long_top,reps=test_inputs.shape[0]),axis=-1),3).transpose(0,3,4,1,2)
 
 # Load the saved model
-best_model = load_model(f'checkpoints/best_model_{current_datetime}.keras',custom_objects={'grad_loss': grad_loss, "transpose_fn": transpose_fn})
+best_model = load_model(f'checkpoints/best_model_20241113_042902_copy.keras',custom_objects={'grad_loss': grad_loss, "transpose_fn": transpose_fn})
 
 # Now you can use `best_model` to make predictions or further evaluations
-predictions = best_model.predict([test_inputs, test_inputs_time, test_extra[0], test_extra[1], test_extra[2], test_direction],)
-
-# mean interpolation
-interpolation = [(test_inputs[:,1:2,:,:,:] + test_inputs[:,0:1,:,:,:]) / 2, (test_inputs[:,2:3,:,:,:] + test_inputs[:,1:2,:,:,:]) / 2]
-interpolation_result = np.concatenate(interpolation, axis=1)
-
-print(f"DCN MAPE error{np.mean(np.abs((test_labels - predictions)/ test_labels))}")
-print(f"mean interpolation MAPE error{np.mean(np.abs((test_labels - interpolation) / test_labels))}")
+predictions = best_model.predict([inf_inputs, inf_inputs_time, inf_extra[0], inf_extra[1], inf_extra[2], inf_inputs_direction],)
 
 
 
@@ -503,14 +384,138 @@ def trilinear_downscale(inputs, target_size):
     downscaled = zoom(inputs, zoom_factors, order=1)  # order=1 for trilinear interpolation
     
     return downscaled
-target_size = 2  # New size for the dimension 1
+target_size = 5  # New size for the dimension 1
 
-trilinear_interpolation = trilinear_downscale(test_inputs, target_size)
+trilinear_interpolation = trilinear_downscale(inf_inputs, target_size)
 trilinear_interpolation = trilinear_interpolation[:, [1, 3], :, :, :]
 
-mse_prediction = np.mean((test_labels - predictions) ** 2)
-mse_baseline = np.mean((test_labels - interpolation) ** 2)
-mse_interpolation = np.mean((test_labels - trilinear_interpolation) ** 2)
-print(f"DCN MSE error {mse_prediction}")
-print(f"mean interpolation MSE error {mse_baseline}")
-print(f"trilinear interpolation MSE error {mse_interpolation}")
+
+# [15,15] because we removed upper left corner during processing so the wanted point is in this index
+point_prediction = predictions[:,:,15,15,0]
+# averaging predictions to have more robust results
+def compute_average(point_prediction):
+    first, second = point_prediction[:,0], point_prediction[:,1]
+    rolled_second = np.roll(second, shift=1)
+    first = np.append(first, rolled_second[0])
+    rolled_second = np.append(rolled_second, rolled_second[0])
+    rolled_second[0] = first[0]
+
+    averaged = (first + rolled_second) / 2
+    return averaged
+
+point_prediction_averaged = compute_average(point_prediction)
+print(point_prediction_averaged.shape)
+
+# create also for the trilinear interpolation to compare
+point_trilinear_interpolation = trilinear_interpolation[:,:,15,15,0]
+point_trilinear_interpolation_averaged =  compute_average(point_trilinear_interpolation)
+
+### Reconstructing actual wind speed
+# Load the normalization parameters from the JSON file
+with open('normalization_params.json', 'r') as f:
+    normalization_params = json.load(f)
+
+# Extract wind speed min and max from the loaded parameters
+wind_speed_min = normalization_params["wind_speed_min"]
+wind_speed_max = normalization_params["wind_speed_max"]
+
+# Reverse normalization for all values in point_prediction_averaged
+prediction_values = point_prediction_averaged * (wind_speed_max - wind_speed_min) + wind_speed_min
+print(f"Prediction values: {prediction_values}")
+
+# Reverse norm for trilinear
+trilinear_values = point_trilinear_interpolation_averaged * (wind_speed_max - wind_speed_min) + wind_speed_min
+print(f"Prediction values: {trilinear_values}")
+
+# import csv
+# # loop to combine the data and write to csv
+# def combine_and_save_csv(dataset_points, predicted_points, output_filename='combined_points.csv'):
+#     """
+#     Combines dataset points and predicted points into a CSV, alternating between them in columns.
+#     """
+    
+#     # Create an empty list to store the alternating points in column pairs
+#     combined_points = []
+
+#     # Alternate between dataset_points and predicted_points
+#     for i in range(len(dataset_points)):
+#         combined_points.append([dataset_points[i]])
+#         if i == len(dataset_points) - 1:
+#             break
+#         combined_points.append([predicted_points[i]])
+
+#     # Write to CSV with two columns: "Dataset Point" and "Predicted Point"
+#     with open(output_filename, mode='w', newline='') as file:
+#         writer = csv.writer(file)
+#         writer.writerows(combined_points)
+
+#     print(f"CSV file with combined points saved as '{output_filename}'.")
+# year = 2019
+
+# combine_and_save_csv(wind_speed_data_point, prediction_values, f'combined_points_DNN_{year}_{model_res}.csv')
+# combine_and_save_csv(wind_speed_data_point, trilinear_values, f'combined_points_trilinear_{year}.csv')
+
+import csv
+from datetime import datetime, timedelta
+
+def combine_and_save_csv(dataset_points, predicted_points, year, interval_minutes=5, output_filename='combined_points.csv'):
+    """
+    Combines dataset points and predicted points into a CSV with timestamps starting from the beginning of the given year.
+    """
+    
+    # Create an empty list to store the combined points with timestamps
+    combined_points = []
+
+    # Set the start date to the beginning of the given year
+    start_date = datetime(year, 1, 1, 0, 0)  # Year, Month=1, Day=1, Hour=0, Minute=0
+    current_time = start_date
+
+    # Loop through the dataset points and predicted points
+    for i in range(len(dataset_points)):
+        # Generate the timestamp for the dataset point
+        year = current_time.year
+        month = current_time.month
+        day = current_time.day
+        hour = current_time.hour
+        minute = current_time.minute
+        
+        # Add the row for the dataset point with the timestamp
+        combined_points.append([
+            year, month, day, hour, minute, dataset_points[i]  # N/A for Wind Direction (to be replaced if available)
+        ])
+        
+        # Update the timestamp for the next prediction
+        current_time += timedelta(minutes=interval_minutes)
+        
+        # If there's a predicted point, add that in the next row
+        if i < len(predicted_points):
+            year = current_time.year
+            month = current_time.month
+            day = current_time.day
+            hour = current_time.hour
+            minute = current_time.minute
+            
+            combined_points.append([
+                year, month, day, hour, minute, predicted_points[i]  # N/A for Wind Direction
+            ])
+        
+        # Update the timestamp for the next dataset point
+        current_time += timedelta(minutes=interval_minutes)
+
+    # Write to CSV with columns: Year, Month, Day, Hour, Minute, Wind Speed, Wind Direction
+    with open(output_filename, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        # Write header
+        writer.writerow(["Year", "Month", "Day", "Hour", "Minute", "Wind Speed"])
+        # Write data
+        writer.writerows(combined_points)
+
+    print(f"CSV file with combined points saved as '{output_filename}'.")
+
+# Year for the data
+# year = 2020
+interval_minutes = 5
+# Call the function to save the CSV
+combine_and_save_csv(wind_speed_data_point, prediction_values, year, interval_minutes, f'combined_points_DNN_{year}_{model_res}.csv')
+combine_and_save_csv(wind_speed_data_point, trilinear_values, year, interval_minutes, f'combined_points_trilinear_{year}.csv')
+

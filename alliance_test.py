@@ -14,6 +14,10 @@ print(tf.__version__)
 physical_devices = tf.config.list_physical_devices('GPU')
 print(len(physical_devices))
 
+from dotenv import load_dotenv
+import os
+load_dotenv()
+ORIGINAL_RESOLUTION = int(os.getenv("ORIGINAL_RESOLUTION"))
 
 def grad_loss(v_gt, v):
     # Gradient loss
@@ -26,7 +30,7 @@ def grad_loss(v_gt, v):
     loss += tf.reduce_mean(tf.abs(jx - jx_), axis=[1,2,3])
     return loss
 
-def uNet(input, time, lat, lon, height, kernel = [5, 3, 3], nodes = [72, 144, 288, 576]):
+def uNet(input, time, lat, lon, height, direction, kernel = [5, 3, 3], nodes = [72, 144, 288, 576]):
     '''
     This function defines a U-Net architecture
     :param input: the main-input layer
@@ -45,7 +49,7 @@ def uNet(input, time, lat, lon, height, kernel = [5, 3, 3], nodes = [72, 144, 28
                    activation   = 'relu',
                    padding      = 'same',
                    data_format  = 'channels_last')(input)
-    mergetime = Concatenate(axis=4)([conv1, lat, lon, height])
+    mergetime = Concatenate(axis=4)([conv1, lat, lon, height, direction])
     conv1 = Conv3D(filters      = nodes[0],
                    kernel_size  = kernel[0],
                    activation   = 'relu',
@@ -186,9 +190,10 @@ def get_model(PS=32, loss = grad_loss, optimizer = 'adam', nodes = [72, 144, 288
     lat         = Input(shape = (3, PS, PS, 1))
     lon         = Input(shape = (3, PS, PS, 1)) 
     height      = Input(shape = (3, PS, PS, 1))
+    direction   = Input(shape = (3, PS, PS, 1))
 
     # Load U-Net
-    unet        = uNet(main_input, time, lat, lon, height, nodes = nodes)
+    unet        = uNet(main_input, time, lat, lon, height, direction, nodes = nodes)
 
     # Define output layer after U-Net
     temp_out    = Conv3D(filters        = 1,
@@ -213,7 +218,7 @@ def get_model(PS=32, loss = grad_loss, optimizer = 'adam', nodes = [72, 144, 288
         temp_out = Add()([main_input[:,1,:,:], temp_out])
 
     # create model with the defined Layers
-    model       = Model(inputs          = [main_input, time, lat, lon, height],
+    model       = Model(inputs          = [main_input, time, lat, lon, height, direction],
                         outputs         = temp_out)
 
     # compile with defined loss and optimizer
@@ -223,20 +228,59 @@ def get_model(PS=32, loss = grad_loss, optimizer = 'adam', nodes = [72, 144, 288
 
     return model
 
-
 # %%
 # Load data
-wind_speed_data = np.load('tensor.npy')  # Assuming wind speed is in the first channel
-print(wind_speed_data.shape)
+
+# List of years to load
+years = [2019, 2020, 2021, 2022]
+# years = [2019]
+# Initialize a list to store data for each year
+data_list = []
+
+# Loop over each year and load the corresponding data
+for year in years:
+    file_name = f'tensor_{year}.npy'
+    year_data = np.load(file_name)  # Load data for the specific year
+    print(f'Shape of {file_name} is {year_data.shape}')
+    data_list.append(year_data)
+
+# Concatenate all data along the first axis
+wind_speed_data = np.concatenate(data_list, axis=0)
+
+# wind_speed_data = np.load('tensor_2020.npy')  # Assuming wind speed is in the first channel
+print(f'Shape of wind speed data is {wind_speed_data.shape}')
 wind_direction_data = wind_speed_data[:, :, :, 1]  # Extract wind direction channel
 wind_speed_data = wind_speed_data[:, :, :, 0]  # Extract wind speed channel
 
+import json
+# Calculate min and max for wind speed and wind direction
+wind_speed_min = np.min(wind_speed_data)
+wind_speed_max = np.max(wind_speed_data)
+
+# Create a dictionary to store the min and max values
+normalization_params = {
+    "wind_speed_min": wind_speed_min,
+    "wind_speed_max": wind_speed_max,
+}
+
+# Save the dictionary to a JSON file
+with open('normalization_params.json', 'w') as f:
+    json.dump(normalization_params, f)
+
+print(f"Normalization parameters saved: {normalization_params}")
 
 # Normalize the data
 wind_speed_data = (wind_speed_data - np.min(wind_speed_data)) / (np.max(wind_speed_data) - np.min(wind_speed_data))
 wind_direction_data = (wind_direction_data - np.min(wind_direction_data)) / (np.max(wind_direction_data) - np.min(wind_direction_data))
 
-print(wind_speed_data.shape, wind_direction_data.shape)
+print(f'Shape of normalized wind speed data is {wind_speed_data.shape}')
+print(f'Shape of normalized wind direction data is {wind_direction_data.shape}')
+
+
+# Load data
+lat_long_top = np.load('lat_long_top.npy')  # Assuming wind speed is in the first channel
+for l in range(lat_long_top.shape[0]):
+    lat_long_top[l] = (lat_long_top[l] - np.min(lat_long_top[l])) / (np.max(lat_long_top[l]) - np.min(lat_long_top[l]))
 
 
 
@@ -244,6 +288,8 @@ print(wind_speed_data.shape, wind_direction_data.shape)
 def reshape_data(data, target_shape=(32, 32)):
     # Reshape data to the target shape
     data = data[..., np.newaxis]
+    # with tf.device('/CPU:0'):
+    #     # resized_data = tf.image.resize(data, target_shape, method='bilinear')
     resized_data = tf.image.resize(data, target_shape, method='bilinear')
     data = resized_data.numpy()
     return data
@@ -253,22 +299,18 @@ def create_patches(data, time_steps):
     training_patches = []
     patches = []
 
-    
-
     for i in range(num_samples):
         patch = data[i:i+time_steps]
         patches.append(patch[1::2])
         training_patches.append(patch[::2])
     training_timestep = time_steps//2+1
     relative_time = np.zeros((time_steps//2+1, data.shape[1]//8, data.shape[2]//8, 1))
-    # relative_time = np.zeros((3, 4, 4, 1))
 
     # Assign specific values to each slice along the first axis
-    # relative_time[0, :, :, 0] = -1
-    # relative_time[1, :, :, 0] = 0
-    # relative_time[2, :, :, 0] = 1
+    half_range = (training_timestep // 2) * 2
+    time_values = np.arange(-half_range, half_range + 1, 2) * ORIGINAL_RESOLUTION
     for t in range(training_timestep):
-        relative_time[t, :, :, 0] = t*2
+        relative_time[t, :, :, 0] = time_values[t]
     relative_time_patches = np.tile(relative_time, (num_samples, 1, 1, 1, 1))
     training_patches = np.array(training_patches)
     patches = np.array(patches)
@@ -278,20 +320,26 @@ def create_patches(data, time_steps):
 
 # Parameters
 patch_size = 32
-time_steps_label = 5
+time_steps_label = 5 # means [0 2 4] for training [1 3] as label
 
 # Reshape data
-reshaped_data = reshape_data(wind_speed_data, target_shape=(32, 32))
+# reshaped_data = reshape_data(wind_speed_data, target_shape=(32, 32))
 
 # Create label patches with time_steps_label
-input_patches, input_time_patches, label_patches = create_patches(reshaped_data, time_steps_label)
+wind_speed_data = np.expand_dims(wind_speed_data, axis=-1)
+input_patches, input_time_patches, label_patches = create_patches(wind_speed_data, time_steps_label)
 
 
 # Reshape direction data
-reshaped_direction = reshape_data(wind_direction_data, target_shape=(32, 32))
+# reshaped_direction = reshape_data(wind_direction_data, target_shape=(32, 32))
 
 # Create label patches with time_steps_label
-input_direction, _, _ = create_patches(reshaped_direction, time_steps_label)
+wind_direction_data = np.expand_dims(wind_direction_data, axis=-1)
+input_direction, _, _ = create_patches(wind_direction_data, time_steps_label)
+
+#%%
+lat_long_top = np.expand_dims(lat_long_top, axis=-1)
+# lat_long_top_reshape = reshape_data(lat_long_top, target_shape=(32, 32))
 
 
 
@@ -303,35 +351,59 @@ print("Label patches shape:", label_patches.shape)
 
 
 # %% get test size
-test_size = input_patches.shape[0]//12
+# take around last month for testing, no overlap
+test_size = input_patches.shape[0]//12//4
 test_inputs = input_patches[-test_size:,:,:,:,:]
 test_direction = input_direction[-test_size:,:,:,:,:]
-
 test_inputs_time = input_time_patches[-test_size:,:,:,:,:]
-
 test_labels = label_patches[-test_size:,:,:,:,:]
 
-# get one month
-one_month_size = input_patches.shape[0]//12 * 2
-input_patches = input_patches[:one_month_size]
-input_time_patches = input_time_patches[:one_month_size]
-label_patches = label_patches[:one_month_size]
-input_direction = input_direction[:one_month_size]
+# get train data size
+train_val_size = input_patches.shape[0] - test_size
+input_patches = input_patches[:train_val_size]
+input_time_patches = input_time_patches[:train_val_size]
+label_patches = label_patches[:train_val_size]
+input_direction = input_direction[:train_val_size]
 
 # %%
-# Define the size of the training set
-train_size = int(0.85 * len(input_patches))  # 80% for training
+# having batches because we want to minimize overlap of the validation and training
+def split_into_batches(data, group_batch_size):
+    """
+    Splits the data into batches of size `group_batch_size`.
+    Returns a list of batches (each batch is an array of indices).
+    """
+    num_batches = len(data) // group_batch_size
+    batches = [data[i*group_batch_size:(i+1)*group_batch_size] for i in range(num_batches)]
+    return batches
 
-# Create indices
-indices = np.arange(len(input_patches))
-np.random.seed(42)  # Set seed for reproducibility
-np.random.shuffle(indices)
+def get_train_val_batches(batches, train_ratio=0.85):
+    """
+    Randomly splits the batches into training and validation sets.
+    `train_ratio` determines the percentage of data for training.
+    """
+    # Shuffle batches
+    np.random.shuffle(batches)
+    
+    # Split into training and validation sets
+    num_train_batches = int(train_ratio * len(batches))
+    train_batches = batches[:num_train_batches]
+    val_batches = batches[num_train_batches:]
+    
+    return train_batches, val_batches
 
-# Split indices into training and validation
-train_indices = indices[:train_size]
-val_indices = indices[train_size:]
+# Step 1: Split data into batches
+data_indices = np.arange(len(input_patches))  # Indices of the data
+group_batch_size = 144  # batch size of 144 which is a day
+batches = split_into_batches(data_indices, group_batch_size)
 
-# Use the indices to split the data
+# Step 2: Randomly split batches into training and validation
+train_batches, val_batches = get_train_val_batches(batches, train_ratio=0.85)
+
+# Step 3: Reassemble the data from batches
+train_indices = np.concatenate(train_batches)
+val_indices = np.concatenate(val_batches)
+
+# Step 4: Use the indices to split the data
 train_inputs = input_patches[train_indices]
 val_inputs = input_patches[val_indices]
 
@@ -344,55 +416,68 @@ val_labels = label_patches[val_indices]
 train_direction = input_direction[train_indices]
 val_direction = input_direction[val_indices]
 
+print("Train patches shape:", train_inputs.shape)
+print("Validation patches shape:", val_inputs.shape)
+
+
+#%% for the latitude longitude and topology
+train_extra = np.tile(np.expand_dims(np.tile(lat_long_top,reps=train_inputs.shape[0]),axis=-1),3).transpose(0,3,4,1,2)
+val_extra = np.tile(np.expand_dims(np.tile(lat_long_top,reps=val_inputs.shape[0]),axis=-1),3).transpose(0,3,4,1,2)
+
 # %%
-from keras.callbacks import ModelCheckpoint
+# from keras.callbacks import ModelCheckpoint
 
-# Define the model
-epochs = 100
-patch_size = 32
-model = get_model(PS=patch_size)
-
-batch_size = 32
-# Define the checkpoint callback
-checkpoint_callback = ModelCheckpoint(
-    filepath='best_model_topology.keras',  # Filepath where the model will be saved
-    monitor='val_loss',        # Monitor the validation loss
-    save_best_only=True,       # Save only the best model
-    save_weights_only=False,   # Save the whole model, not just weights
-    mode='min',                # Mode 'min' means it will save the model with the minimum validation loss
-    verbose=1                  # Verbosity mode
-)
-
-# Train the model with validation and checkpointing
-history = model.fit(
-    [train_inputs, train_inputs_time, train_inputs, train_inputs, train_direction],
-    train_labels,
-    validation_data=([val_inputs, val_inputs_time, val_inputs, val_inputs, val_direction], val_labels),
-    epochs=epochs,
-    batch_size=batch_size,
-    callbacks=[checkpoint_callback],
-    verbose=1
-)
+# # Define the model
+# epochs = int(os.getenv("EPOCHS"))
+# batch_size = 32
+# model = get_model(PS=batch_size)
 
 
+# from datetime import datetime
+# # Define the checkpoint callback
+# current_datetime = datetime.now().strftime('%Y%m%d_%H%M%S')
 
-#%%
+# checkpoint_callback = ModelCheckpoint(
+#     filepath=f'checkpoints/best_model_{current_datetime}.keras',  # Filepath where the model will be saved
+#     monitor='val_loss',        # Monitor the validation loss
+#     save_best_only=True,       # Save only the best model
+#     save_weights_only=False,   # Save the whole model, not just weights
+#     mode='min',                # Mode 'min' means it will save the model with the minimum validation loss
+#     verbose=1                  # Verbosity mode
+# )
+
+# # Train the model with validation and checkpointing
+# history = model.fit(
+#     [train_inputs, train_inputs_time, train_extra[0], train_extra[1], train_extra[2], train_direction],
+#     train_labels,
+#     validation_data=([val_inputs, val_inputs_time, val_extra[0], val_extra[1], val_extra[2], val_direction], val_labels),
+#     epochs=epochs,
+#     batch_size=batch_size,
+#     callbacks=[checkpoint_callback],
+#     verbose=1
+# )
+
+
+#%% testing
 def transpose_fn(x):
       return tf.transpose(x, perm=[0, 4, 2, 3, 1])
 from keras.models import load_model
 
+#%% 
+test_extra = np.tile(np.expand_dims(np.tile(lat_long_top,reps=test_inputs.shape[0]),axis=-1),3).transpose(0,3,4,1,2)
+
 # Load the saved model
-best_model = load_model('best_model_topology.keras',custom_objects={'grad_loss': grad_loss, "transpose_fn": transpose_fn})
+best_model = load_model(f'checkpoints/best_model_20241113_042902_copy.keras',custom_objects={'grad_loss': grad_loss, "transpose_fn": transpose_fn})
 
 # Now you can use `best_model` to make predictions or further evaluations
-predictions = best_model.predict([test_inputs,test_inputs_time,test_inputs,test_inputs,test_direction])
+predictions = best_model.predict([test_inputs, test_inputs_time, test_extra[0], test_extra[1], test_extra[2], test_direction],)
 
 # mean interpolation
 interpolation = [(test_inputs[:,1:2,:,:,:] + test_inputs[:,0:1,:,:,:]) / 2, (test_inputs[:,2:3,:,:,:] + test_inputs[:,1:2,:,:,:]) / 2]
-interpolation_result = np.concatenate(interpolation, axis=1).shape
+interpolation_result = np.concatenate(interpolation, axis=1)
 
-print(f"DCN error{np.mean(np.abs((test_labels - predictions)/ test_labels))}")
-print(f"mean interpolation error{np.mean(np.abs((test_labels - interpolation) / test_labels))}")
+print(f"DCN MAPE error{np.mean(np.abs((test_labels - predictions)/ test_labels))}")
+print(f"mean interpolation MAPE error{np.mean(np.abs((test_labels - interpolation) / test_labels))}")
 
 
 
@@ -418,13 +503,14 @@ def trilinear_downscale(inputs, target_size):
     downscaled = zoom(inputs, zoom_factors, order=1)  # order=1 for trilinear interpolation
     
     return downscaled
-target_size = 2  # New size for the dimension 1
+target_size = 5  # New size for the dimension 1
 
-downscaled_interpolation = trilinear_downscale(test_inputs, target_size)
+trilinear_interpolation = trilinear_downscale(test_inputs, target_size)
+trilinear_interpolation = trilinear_interpolation[:, [1, 3], :, :, :]
 
 mse_prediction = np.mean((test_labels - predictions) ** 2)
 mse_baseline = np.mean((test_labels - interpolation) ** 2)
-mse_interpolation = np.mean((test_labels - downscaled_interpolation) ** 2)
-print(f"DCN error{mse_prediction}")
-print(f"mean interpolation error{mse_baseline}")
-print(f"trilinear interpolation error{mse_interpolation}")
+mse_interpolation = np.mean((test_labels - trilinear_interpolation) ** 2)
+print(f"DCN MSE error {mse_prediction}")
+print(f"mean interpolation MSE error {mse_baseline}")
+print(f"trilinear interpolation MSE error {mse_interpolation}")

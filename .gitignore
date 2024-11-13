@@ -3,3 +3,5 @@ checkpoints/
 venv/
 other_tests/
 data/
+*.npy
+*.keras
